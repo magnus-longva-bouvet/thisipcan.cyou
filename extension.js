@@ -19,6 +19,7 @@
  * Christian Wittenberg <gnome@ipcan.cyou>
  *
  */
+
 const {
     St,
     Clutter,
@@ -40,7 +41,8 @@ const ExtensionUtils = imports.misc.extensionUtils;
 const Me = ExtensionUtils.getCurrentExtension();
 const thisExtensionDir = Me.path;
 
-const extIpService = 'https://thisipcan.cyou/json';
+const extIpv4Service = 'https://ipv4.icanhazip.com';
+const extIpService = 'https://freeipapi.com/api/json';
 const extIpServiceASN = 'https://thisipcan.cyou/';
 const extIpServiceStaticMap = 'https://staticmap.thisipcan.cyou/';
 const extCountryFlagService = 'https://thisipcan.cyou/flag-<countrycode>';
@@ -290,7 +292,8 @@ function refreshIP() {
 
         lastCheck = t;
         
-        let resp = httpRequest(extIpService);        
+        let ipv4address = httpRequest(extIpv4Service);
+        let resp = httpRequest(extIpService + "/" + ipv4address );        
 
         if(resp == null || resp == "") { 
             lg("Null response received");
