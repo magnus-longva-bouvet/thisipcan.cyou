@@ -78,12 +78,11 @@ let popup_icon = null;
 
 let Indicator = GObject.registerClass(
     class Indicator extends PanelMenu.Button {                        
-        update(ip, country) {                        
-            //cache locally            
-            let flagURL = getCachedFlag(country.toLowerCase());            
-
+         update(ip, country) {
+            const cc = (typeof country === 'string' && country.length) ? country.toLowerCase() : null;
+            const flagURL = cc ? getCachedFlag(cc) : (thisExtensionDir + '/img/ip.svg'); // fallback icon
             btn.set_style('background-image: url("' + flagURL + '");');
-            btn.set_label(ip);     
+            btn.set_label(ip || "");
         }
 
         _init(ip="", country="gb") {
@@ -146,8 +145,13 @@ let Indicator = GObject.registerClass(
                 }
             }
 
-            let flagIcon = getIcon(getCachedFlag(locationIP.countryCode), true);
-            let countryBtn = new PopupMenu.PopupImageMenuItem(_(locationIP.countryName + " (" + locationIP.countryCode + "), " + locationIP.cityName), flagIcon, {});
+            const cc = (locationIP && typeof locationIP.countryCode === 'string' && locationIP.countryCode) ? locationIP.countryCode : null;
+            const flagFile = cc ? getCachedFlag(cc) : (thisExtensionDir + '/img/ip.svg');
+            const flagIcon = getIcon(flagFile, true);
+            const cName = locationIP && locationIP.countryName ? locationIP.countryName : 'Unknown';
+            const city  = locationIP && locationIP.cityName ? (", " + locationIP.cityName) : "";
+            const ccTxt = cc ? (" (" + cc + ")") : "";
+            let countryBtn = new PopupMenu.PopupImageMenuItem(_(cName + ccTxt + city), flagIcon, {});
             countryBtn.connect('activate', copyTextFunction);
             obj.menu.addMenuItem(countryBtn);         
 
@@ -276,6 +280,7 @@ function notify(title, msg) {
 }
 
 function getFlagUrl(countryCode) {
+    if (!countryCode || typeof countryCode !== 'string') return null;
     return extCountryFlagService.replace("<countrycode>", countryCode.toLowerCase());
 }
 
@@ -292,7 +297,7 @@ function refreshIP() {
 
         lastCheck = t;
         
-        let ipv4address = httpRequest(extIpv4Service);
+        let ipv4address = (httpRequest(extIpv4Service) || '').trim();
         let resp = httpRequest(extIpService + "/" + ipv4address );        
 
         if(resp == null || resp == "") { 
@@ -320,10 +325,11 @@ function refreshIP() {
 
         lg("New IP: " + currentIP + " - " + locationIP.countryName + " (" + locationIP.countryCode + ")");
 
-        lg(getFlagUrl(locationIP.countryCode));
+        const fUrl = getFlagUrl(locationIP.countryCode);
+        if (fUrl) lg(fUrl);
 
-        if(panelButton != null) {            
-            panelButton.update(currentIP, locationIP.countryCode);
+        if (panelButton != null) {
+            panelButton.update(currentIP, locationIP.countryCode || null);
         }
     }
 
@@ -401,6 +407,10 @@ function getCachedMap(lat,lon) {
 
 // Download application specific flags and cache locally
 function getCachedFlag(country) {
+    if (!country || typeof country !== 'string') {
+        // Neutral icon if we don't know the country
+        return thisExtensionDir + '/img/ip.svg';
+    }
     country = country.toLowerCase();
 
     let iconFileDestination = thisExtensionDir + '/flags/' + country + '.svg';
