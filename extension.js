@@ -173,22 +173,27 @@ let Indicator = GObject.registerClass(
             countryBtn.connect('activate', copyTextFunction);
             obj.menu.addMenuItem(countryBtn);         
 
-            if("longitude" in locationIP && "latitude" in locationIP) {
-                //show map, clicking on it will open google maps with a pin
+            if (typeof locationIP.latitude === 'number' && typeof locationIP.longitude === 'number') {
+                const latKey = normCoord(locationIP.latitude, 5);
+                const lonKey = normCoord(locationIP.longitude, 5);
 
-                let mapImageBtn = new PopupMenu.PopupMenuItem(_(""), { style_class: 'mapMenuItem' });                                            
-                mapImageBtn.set_style("background-image: url('" + getCachedMap(locationIP.latitude, locationIP.longitude) + "')");
+                const mapItem = new PopupMenu.PopupMenuItem(_(""), { style_class: 'mapMenuItem' });
+                const mapPath = getCachedMap(latKey, lonKey);
 
-                let mapsUrl = 'https://maps.google.com/maps?q=' + String(locationIP.latitude) + ',' + String(locationIP.longitude);
-                
-                mapImageBtn.connect('activate', function(item, event) {           
-                    log(mapsUrl);
-                    GLib.spawn_command_line_async("xdg-open \"" + mapsUrl + "\"");
+                if (mapPath) {
+                    mapItem.set_style("background-image: url('file://" + mapPath + "')");
+                } else {
+                    const text = _("Coordinates: ") + latKey + ", " + lonKey;
+                    mapItem.label.set_text(text); // PopupMenuItem doesn't have set_label()
+                }
 
+                const mapsUrl = 'https://maps.google.com/maps?q=' + latKey + ',' + lonKey;
+                mapItem.connect('activate', function () {
+                    GLib.spawn_command_line_async('xdg-open "' + mapsUrl + '"');
                     return Clutter.EVENT_PROPAGATE;
                 });
 
-                obj.menu.addMenuItem(mapImageBtn);   
+                obj.menu.addMenuItem(mapItem);
             }
 
             obj.menu.toggle();            
@@ -376,44 +381,59 @@ function ipPromise() {
 
 function init() {}
 
-// Download application specific flags and cache locally
-function getCachedMap(lat,lon) {    
-    let mapFileDestination = thisExtensionDir + '/maps/' + lat + '_' + lon + '.svg';
-
-    const cwd = Gio.File.new_for_path(thisExtensionDir + "/maps/");
-    const newFile = cwd.get_child(lat + '_' + lon + ".svg");
-
-    // detects if icon is cached (exists)
-    const fileExists = newFile.query_exists(null);
-
-    if (!fileExists) {
-        // download and save in cache folder
-        // do this synchronously to ensure notifications always get a logo
-        let _httpSession = new Soup.SessionSync();
-
-        let url = extIpServiceStaticMap + "?lat=" + lat + "&lon=" + lon + "&f=SVG&marker=12&w=250&h=150";
-        
-        let message = Soup.Message.new('GET', url);
-        let responseCode = _httpSession.send_message(message);
-        let out = null;
-        let resp = null;
-        if (responseCode == 200) {
-            try {
-                let bytes = message['response-body'].flatten().get_data();
-                const file = Gio.File.new_for_path(mapFileDestination);
-                const [, etag] = file.replace_contents(bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-            } catch (e) {
-                lg("Error in cached flag");
-                lg(e);
-            }
-        }
-
-    } else {
-        // icon is readily cached, return from icons folder locally        
-    }
-
-    return mapFileDestination;
+function normCoord(val, decimals = 5) {
+  // force number → fixed decimals string
+  const n = Number(val);
+  if (!isFinite(n)) return null;
+  return n.toFixed(decimals); // e.g. "59.91275"
 }
+
+
+// Download application specific flags and cache locally
+function getCachedMap(lat, lon) {
+  const latKey = normCoord(lat, 5);
+  const lonKey = normCoord(lon, 5);
+  if (latKey === null || lonKey === null) return null;
+
+  const dir = thisExtensionDir + '/maps/';
+  const mapFile = dir + latKey + '_' + lonKey + '.svg';
+
+  // Ensure directory exists
+  const dirFile = Gio.File.new_for_path(dir);
+  if (!dirFile.query_exists(null)) {
+    try { dirFile.make_directory_with_parents(null); } catch (_) {}
+  }
+
+  const fileObj = Gio.File.new_for_path(mapFile);
+  if (!fileObj.query_exists(null)) {
+    // Fetch using the same normalized coords (keeps filename + server request consistent)
+    const url = extIpServiceStaticMap
+              + '?lat=' + latKey
+              + '&lon=' + lonKey
+              + '&f=SVG&marker=12&w=250&h=150';
+
+    const session = new Soup.SessionSync();
+    const msg = Soup.Message.new('GET', url);
+    const code = session.send_message(msg);
+    if (code === 200) {
+      try {
+        const bytes = msg['response-body'].flatten().get_data();
+        fileObj.replace_contents(bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+      } catch (e) {
+        lg('Error saving cached map: ' + e);
+        return null;
+      }
+    } else {
+      // download failed
+      return null;
+    }
+  }
+
+  return fileObj.query_exists(null) ? mapFile : null;
+}
+
+
+
 
 // Download application specific flags and cache locally
 function getCachedFlag(country) {
