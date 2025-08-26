@@ -28,6 +28,13 @@ const {
     GLib,
     GObject
 } = imports.gi;
+
+const ExtensionUtils = imports.misc.extensionUtils;
+const Me = ExtensionUtils.getCurrentExtension();
+const { IpLookup } = Me.imports.ip_lookup;
+let ipLookup = null;
+let lastLookup = { ip: null, geo: null, asn: null }; // cached result
+
 const Mainloop = imports.mainloop;
 const Main = imports.ui.main;
 const Util = imports.misc.util;
@@ -37,8 +44,6 @@ const PanelMenu = imports.ui.panelMenu;
 
 notification_msg_sources = new Set();   // stores IDs of previously displayed notifications (for providing a handle to destruction)
 
-const ExtensionUtils = imports.misc.extensionUtils;
-const Me = ExtensionUtils.getCurrentExtension();
 const thisExtensionDir = Me.path;
 
 const extIpv4Service = 'https://ipv4.icanhazip.com';
@@ -121,29 +126,42 @@ let Indicator = GObject.registerClass(
             copyBtn.connect('activate', copyTextFunction);
             obj.menu.addMenuItem(copyBtn);                                                              
             
-            //retrieve ASN / org details            
-            let asnText = httpRequest(extIpServiceASN, "GET");
-            if(asnText != "" && asnText != null) {
-                let asn = JSON.parse(asnText);
-                
-                if("hostname" in asn) {
-                    let hostBtn = new PopupMenu.PopupImageMenuItem(_(asn.hostname), getIcon("host.svg"), {});
-                    hostBtn.connect('activate', copyTextFunction);
-                    obj.menu.addMenuItem(hostBtn);           
-                }
+            // Show a temporary "Loading…" row, then update asynchronously
+            let loading = new PopupMenu.PopupMenuItem(_("Loading network info…"), { reactive: false });
+            obj.menu.addMenuItem(loading);
 
-                if("org" in asn) {                       
-                    let orgBtn = new PopupMenu.PopupImageMenuItem(_(asn.org), getIcon("company.svg"), {});
-                    orgBtn.connect('activate', copyTextFunction);
-                    obj.menu.addMenuItem(orgBtn);           
-                }
-
-                if("timezone" in asn) {           
-                    let tzBtn = new PopupMenu.PopupImageMenuItem(_(asn.timezone), getIcon("timezone.svg"), {});
-                    tzBtn.connect('activate', copyTextFunction);
-                    obj.menu.addMenuItem(tzBtn);           
-                }
+            httpRequestAsync(extIpServiceASN, (err, txt) => {
+            let asn = null;
+            if (!err && txt) {
+                try { asn = JSON.parse(txt); } catch (_) {}
             }
+            // Update the menu on the main loop once we have data
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    // Rebuild the menu section after "Loading…"
+                    if (asn) {
+                    if ("hostname" in asn) {
+                        let hostBtn = new PopupMenu.PopupImageMenuItem(_(asn.hostname), getIcon("host.svg"), {});
+                        hostBtn.connect('activate', copyTextFunction);
+                        obj.menu.addMenuItem(hostBtn);
+                    }
+                    if ("org" in asn) {
+                        let orgBtn = new PopupMenu.PopupImageMenuItem(_(asn.org), getIcon("company.svg"), {});
+                        orgBtn.connect('activate', copyTextFunction);
+                        obj.menu.addMenuItem(orgBtn);
+                    }
+                    if ("timezone" in asn) {
+                        let tzBtn = new PopupMenu.PopupImageMenuItem(_(asn.timezone), getIcon("timezone.svg"), {});
+                        tzBtn.connect('activate', copyTextFunction);
+                        obj.menu.addMenuItem(tzBtn);
+                    }
+                    } else {
+                    loading.label.set_text(_("Failed to load network info"));
+                    }
+                    // Remove the loading row
+                    obj.menu.box.remove_child(loading.actor || loading);
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
 
             const cc = (locationIP && typeof locationIP.countryCode === 'string' && locationIP.countryCode) ? locationIP.countryCode : null;
             const flagFile = cc ? getCachedFlag(cc) : (thisExtensionDir + '/img/ip.svg');
@@ -287,51 +305,43 @@ function getFlagUrl(countryCode) {
 // gets external IP and updates label in toolbar
 // if changed, show GNOME notification
 let lastCheck = 0;
-let locationIP = null; 
+let locationIP = null;
+
 function refreshIP() {
+    const now = Date.now();
+    if (now - lastCheck <= minTimeBetweenChecks * 1000) return;
+    lastCheck = now;
 
-    let t = new Date().getTime();
-    if(t - lastCheck <= minTimeBetweenChecks * 1000)  {        
-        return;
-    } else {
-
-        lastCheck = t;
-        
-        let ipv4address = (httpRequest(extIpv4Service) || '').trim();
-        let resp = httpRequest(extIpService + "/" + ipv4address );        
-
-        if(resp == null || resp == "") { 
-            lg("Null response received");
-            return;
-        } else {
-            lg("JSON response (" + extIpService + "):");
-            lg(resp);
-        }
-
-        locationIP = JSON.parse(resp);        
-
-        if (currentIP != "" && currentIP != locationIP.ipAddress) {
-            //new ip address found.
-            lg('Note: External IP address has been changed into ' + locationIP.ipAddress + ", trigger GNOME notification")        
-
-            try {
-                notify('External IP Address', 'Has been changed to ' + locationIP.ipAddress);
-            } catch(err) {
-                lg(err);
-            }
-        }
-
-        currentIP = locationIP.ipAddress;
-
-        lg("New IP: " + currentIP + " - " + locationIP.countryName + " (" + locationIP.countryCode + ")");
-
-        const fUrl = getFlagUrl(locationIP.countryCode);
-        if (fUrl) lg(fUrl);
-
-        if (panelButton != null) {
-            panelButton.update(currentIP, locationIP.countryCode || null);
-        }
+    const { ip, geo, asn } = ipLookup.getAll();
+    if (!ip || !geo) {
+        lg('IP/Geo lookup failed or empty; skipping update');
+        return true;
     }
+
+    // Fill missing fields sensibly
+    locationIP = {
+        ipAddress: ip,
+        countryCode: geo.countryCode,
+        countryName: geo.countryName,
+        cityName: geo.cityName,
+        latitude: geo.latitude,
+        longitude: geo.longitude,
+    };
+    lastLookup = { ip, geo, asn };
+
+    if (currentIP && currentIP !== ip) {
+        try { notify('External IP Address', `Has been changed to ${ip}`); } catch(e) { lg(e); }
+    }
+    currentIP = ip;
+
+    // Safe logging
+    if (locationIP.countryCode) {
+        const url = getFlagUrl(locationIP.countryCode);
+        if (url) lg(url);
+    }
+
+    // Update panel robustly
+    if (panelButton) panelButton.update(currentIP, locationIP.countryCode || null);
 
     return true;
 }
@@ -465,6 +475,8 @@ function getIcon(fileName, noPrefix=false) {
 function enable() {
     disabled = false;
 
+    if (!ipLookup) ipLookup = new IpLookup();
+
     // Initialize icon once to prevent unnecessary reloading, unload in disable.
     popup_icon = getIcon("ip.svg");
 
@@ -554,4 +566,13 @@ function disable() {
 
     // Destroy indicator altogether    
     //Indicator = null;
+}
+
+function httpRequestAsync(url, cb) {
+  const session = new Soup.Session();               // async
+  const msg = Soup.Message.new('GET', url);
+  session.queue_message(msg, (_sess, m) => {
+    if (m.status_code === 200) cb(null, m.response_body.data);
+    else cb(new Error(`HTTP ${m.status_code}`));
+  });
 }
