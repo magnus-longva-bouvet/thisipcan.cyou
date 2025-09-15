@@ -45,7 +45,8 @@ const extIpServiceASN = "https://thisipcan.cyou/";
 const extIpServiceStaticMap = "https://staticmap.thisipcan.cyou/";
 const extCountryFlagService = "https://thisipcan.cyou/flag-<countrycode>";
 
-let debug = false;
+// Enable verbose logging for diagnostics (set to false to silence)
+let debug = true;
 let panelButtonText = null;
 let panelIcon = null;
 let sourceLoopID = null;
@@ -314,7 +315,23 @@ function _onNetworkStatusChanged(status = null) {
 }
 
 function lg(s) {
-  if (debug == true) log("===" + Me.metadata["gettext-domain"] + "===>" + s);
+  if (!debug) return;
+  try {
+    log("===" + Me.metadata["gettext-domain"] + "===>" + s);
+  } catch (_) {}
+}
+
+function warn(s) {
+  try {
+    log("*** " + Me.metadata["gettext-domain"] + " WARNING: " + s);
+  } catch (_) {}
+}
+
+function isDisabled() { return disabled === true; }
+
+function safeActorDesc(a) {
+  if (!a) return '<null>';
+  try { return a.toString(); } catch (_) { return '<actor?>'; }
 }
 
 // returns raw HTTP response
@@ -343,24 +360,50 @@ function httpRequest(url, type = "GET") {
 // - bugfix: added fix for missing icon specification in Source constructor, this caused occassional crashes to Logout
 // - moved popup_icon to a once-initialized variable to prevent unnecessary reloading.
 function notify(title, msg) {
-  let source = new MessageTray.Source(title, "img/ip.svg");
+  if (isDisabled()) {
+    lg("notify() skipped; extension disabled");
+    return;
+  }
+  let source;
+  try {
+    source = new MessageTray.Source(title, "img/ip.svg");
+  } catch (e) {
+    warn("Failed to create MessageTray.Source: " + e);
+    return;
+  }
 
   notification_msg_sources.add(source);
+  lg("notify(): created source " + safeActorDesc(source));
 
-  //ensure notification is added to GNOME message tray
-  Main.messageTray.add(source);
+  try {
+    Main.messageTray.add(source);
+  } catch (e) {
+    warn("Failed to add notification source: " + e);
+    return;
+  }
 
-  let notification = new MessageTray.Notification(source, title, msg, {
-    bannerMarkup: true,
-    gicon: popup_icon,
-  });
+  let notification;
+  try {
+    notification = new MessageTray.Notification(source, title, msg, {
+      bannerMarkup: true,
+      gicon: popup_icon,
+    });
+  } catch (e) {
+    warn("Failed to build notification object: " + e);
+    return;
+  }
 
-  //set to destroy messages in stack also
   notification.connect("destroy", (destroyed_source) => {
+    lg("notification destroy signal for " + safeActorDesc(destroyed_source.source));
     notification_msg_sources.delete(destroyed_source.source);
   });
 
-  source.showNotification(notification);
+  try {
+    source.showNotification(notification);
+    lg("notify(): displayed notification");
+  } catch (e) {
+    warn("Failed to show notification: " + e);
+  }
 }
 
 function getFlagUrl(countryCode) {
@@ -377,17 +420,30 @@ let lastCheck = 0;
 let locationIP = null;
 
 function refreshIP() {
+  if (isDisabled()) {
+    lg("refreshIP(): skipped; extension disabled");
+    return true;
+  }
   const now = Date.now();
-  if (now - lastCheck <= minTimeBetweenChecks * 1000) return;
+  if (now - lastCheck <= minTimeBetweenChecks * 1000) {
+    lg("refreshIP(): throttled");
+    return true;
+  }
   lastCheck = now;
 
-  const { ip, geo, asn } = ipLookup.getAll();
+  let payload;
+  try {
+    payload = ipLookup.getAll();
+  } catch (e) {
+    warn("refreshIP(): ipLookup.getAll failed: " + e);
+    return true; // don't explode timer loops
+  }
+  const { ip, geo, asn } = payload;
   if (!ip || !geo) {
-    lg("IP/Geo lookup failed or empty; skipping update");
+    lg("refreshIP(): IP/Geo lookup failed or empty; skipping update");
     return true;
   }
 
-  // Fill missing fields sensibly
   locationIP = {
     ipAddress: ip,
     countryCode: geo.countryCode,
@@ -400,28 +456,33 @@ function refreshIP() {
   lastLookup = { ip, geo, asn };
 
   if (currentIP && currentIP !== ip) {
+    lg(`refreshIP(): IP changed ${currentIP} -> ${ip}`);
     try {
       notify("External IP Address", `Has been changed to ${ip}`);
     } catch (e) {
-      lg(e);
+      warn("refreshIP(): notify failed: " + e);
     }
   }
   currentIP = ip;
 
-  // Safe logging
   if (locationIP.countryCode) {
     const url = getFlagUrl(locationIP.countryCode);
-    if (url) lg(url);
+    if (url) lg("refreshIP(): flag URL " + url);
   }
 
-  // Update panel robustly
-  if (panelButton)
-    panelButton.update(
-      currentIP,
-      locationIP.countryCode,
-      locationIP.isp || null
-    );
-
+  if (panelButton) {
+    try {
+      panelButton.update(
+        currentIP,
+        locationIP.countryCode,
+        locationIP.isp || null
+      );
+    } catch (e) {
+      warn("refreshIP(): panelButton.update failed (possibly destroyed actor): " + e);
+    }
+  } else {
+    lg("refreshIP(): panelButton null (likely disabled)");
+  }
   return true;
 }
 
@@ -447,10 +508,11 @@ function timer() {
 // Run polling procedure completely async
 function ipPromise() {
   return new Promise((resolve, reject) => {
-    if (refreshIP()) {
-      resolve("success");
-    } else {
-      reject("error");
+    try {
+      if (refreshIP()) resolve("success"); else reject("error");
+    } catch (e) {
+      warn("ipPromise(): refreshIP threw: " + e);
+      resolve("handled-exception");
     }
   });
 }
@@ -581,112 +643,122 @@ function getIcon(fileName, noPrefix = false) {
 }
 
 function enable() {
+  lg("enable(): starting");
   disabled = false;
 
   if (!ipLookup) ipLookup = new IpLookup();
 
-  // Initialize icon once to prevent unnecessary reloading, unload in disable.
   popup_icon = getIcon("ip.svg");
 
-  // Prepare UI
-  messageTray = new MessageTray.MessageTray();
-
   if (panelButton == null) {
+    lg("enable(): creating Indicator");
     panelButton = new Indicator();
   }
 
-  // Add the button to the panel
-  let uuid = Me.metadata.uuid;
-  Main.panel.addToStatusArea(uuid, panelButton, 0, "right");
+  try {
+    const uuid = Me.metadata.uuid;
+    Main.panel.addToStatusArea(uuid, panelButton, 0, "right");
+    lg("enable(): panel button added");
+  } catch (e) {
+    warn("enable(): failed to add panel button: " + e);
+  }
 
   presence = new GnomeSession.Presence((proxy, error) => {
-    //_onNetworkStatusChanged(proxy.status);
     _onStatusChanged(proxy.status);
   });
   presence_connection = presence.connectSignal(
     "StatusChanged",
     (proxy, senderName, [status]) => {
-      //_onNetworkStatusChanged(status);
       _onStatusChanged(status);
     }
   );
+  lg("enable(): presence connected id=" + presence_connection);
 
   networkMonitorEnable();
 
-  // After enabling, immediately get ip
   refreshIP();
-
-  // Enable timer
   timer();
 }
 
 function networkMonitorEnable() {
-  // Enable network event monitoring
+  if (network_monitor) return; // already
   network_monitor = Gio.network_monitor_get_default();
-  network_monitor_connection = network_monitor.connect(
-    "network-changed",
-    _onNetworkStatusChanged
-  );
+  try {
+    network_monitor_connection = network_monitor.connect(
+      "network-changed",
+      _onNetworkStatusChanged
+    );
+    lg("networkMonitorEnable(): connected id=" + network_monitor_connection);
+  } catch (e) {
+    warn("networkMonitorEnable(): failed: " + e);
+  }
 }
 
 function networkMonitorDisable() {
-  // Cleanup network monitor properly
-  network_monitor.disconnect(network_monitor_connection);
+  if (network_monitor && network_monitor_connection) {
+    try { network_monitor.disconnect(network_monitor_connection); } catch (e) { warn("networkMonitorDisable(): disconnect failed: " + e); }
+  }
   network_monitor = null;
-
-  // Remove timer for network events
+  network_monitor_connection = null;
   if (networkEventRefreshLoopID) {
     GLib.Source.remove(networkEventRefreshLoopID);
     networkEventRefreshLoopID = null;
   }
+  lg("networkMonitorDisable(): done");
 }
 
 function disable() {
-  // Set to true so if the timer hits, stop.
+  lg("disable(): starting cleanup");
   disabled = true;
 
-  // clear messagetray - and any associated remaining sources
   for (let source of notification_msg_sources) {
-    source.destroy();
+    try { source.destroy(); } catch (_) {}
   }
+  notification_msg_sources.clear();
 
   popup_icon = null;
-
   messageTray = null;
 
-  // clear UI widgets
-  // Remove the added button from panel
-  // bugfix: remove panelButton before setting to null
-  Main.panel.remove_child(panelButton);
-  panelButton.destroy();
-
+  if (panelButton) {
+    try {
+      panelButton.destroy(); // destroy is enough; remove_child not required
+      lg("disable(): panelButton destroyed");
+    } catch (e) {
+      warn("disable(): panelButton destroy failed: " + e);
+    }
+  }
   panelButton = null;
   panelButtonText = null;
-
   btn = null;
-
   locationIP = null;
 
-  presence.disconnectSignal(presence_connection);
+  if (presence && presence_connection) {
+    try { presence.disconnectSignal(presence_connection); } catch (e) { warn("disable(): presence disconnect failed: " + e); }
+  }
   presence = null;
+  presence_connection = null;
 
   networkMonitorDisable();
 
-  // Remove timer loop altogether
   if (sourceLoopID) {
     GLib.Source.remove(sourceLoopID);
     sourceLoopID = null;
   }
-
-  // Destroy indicator altogether
-  //Indicator = null;
+  lg("disable(): finished");
 }
 
 function httpRequestAsync(url, cb) {
   const session = new Soup.Session(); // async
   const msg = Soup.Message.new("GET", url);
   session.queue_message(msg, (_sess, m) => {
-    if (m.status_code === 200) cb(null, m.response_body.data);
-    else cb(new Error(`HTTP ${m.status_code}`));
+    if (isDisabled()) {
+      lg("httpRequestAsync(): callback skipped; disabled");
+      return;
+    }
+    try {
+      if (m.status_code === 200) cb(null, m.response_body.data); else cb(new Error(`HTTP ${m.status_code}`));
+    } catch (e) {
+      warn("httpRequestAsync(): user callback threw: " + e);
+    }
   });
 }
