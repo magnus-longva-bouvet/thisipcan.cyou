@@ -57,7 +57,7 @@ let messageTray = null;
 let currentIP = ""; // stores previously detected external ip
 let disabled = false; // stop processing if extension is disabled
 let elapsed = 0; // time elapsed before next external ip check
-let timeout = 60 * 10; // be friendly, refresh every 10 mins.
+let timeout = 60 * 1; // be friendly, refresh every 1 min.
 let minTimeBetweenChecks = 4; //in seconds, to avoid network event induced IP re-checks occur too frequent
 
 // Network event monitoring
