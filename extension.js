@@ -27,6 +27,8 @@ const Me = ExtensionUtils.getCurrentExtension();
 const { IpLookup } = Me.imports.ip_lookup;
 let ipLookup = null;
 let lastLookup = { ip: null, geo: null, asn: null }; // cached result
+let refreshInFlight = false;
+let refreshGen = 0;
 
 const Mainloop = imports.mainloop;
 const Main = imports.ui.main;
@@ -67,6 +69,8 @@ let network_monitor_connection = null;
 
 let networkEventRefreshTimeout = 4;
 let networkEventRefreshLoopID = null;
+let netEventSuppressNotifyUntil = 0; // ms since epoch
+let netEventSeenAt = 0;
 
 let isIdle = false;
 
@@ -198,7 +202,9 @@ let Indicator = GObject.registerClass(
             loading.label.set_text(_("Failed to load network info"));
           }
           // Remove the loading row
-          obj.menu.box.remove_child(loading.actor || loading);
+          try {
+            loading.destroy();
+          } catch (_) {}
           return GLib.SOURCE_REMOVE;
         });
       });
@@ -296,22 +302,122 @@ function _onStatusChanged(presence, status) {
 }
 
 // In case of a network event, inquire external IP.
-function _onNetworkStatusChanged(status = null) {
-  if (status != null && !isIdle) {
-    lg("Network event has been triggered. Re-check ext. IP");
+function _onNetworkStatusChanged(maybeMonitor, maybeAvailable) {
+  try {
+    if (isIdle) return;
 
-    if (status.get_network_available()) {
-      lg("Network is now available... rechecking IP, give it a few secs");
+    const available =
+      typeof maybeAvailable === "boolean"
+        ? maybeAvailable
+        : maybeMonitor && maybeMonitor.get_network_available
+        ? maybeMonitor.get_network_available()
+        : false;
 
-      networkEventRefreshLoopID = Mainloop.timeout_add_seconds(
-        networkEventRefreshTimeout,
-        function () {
-          lg("Network event triggered refresh");
-          refreshIP();
-        }
-      );
+    lg(`Network changed: available=${available}`);
+
+    if (networkEventRefreshLoopID) {
+      try {
+        GLib.Source.remove(networkEventRefreshLoopID);
+      } catch (_) {}
+      networkEventRefreshLoopID = null;
     }
+
+    if (!available) return;
+
+    // Debounce and set a 15s “no notifications” window
+    netEventSeenAt = Date.now();
+    netEventSuppressNotifyUntil = netEventSeenAt + 15000;
+
+    networkEventRefreshLoopID = Mainloop.timeout_add_seconds(
+      networkEventRefreshTimeout,
+      () => {
+        networkEventRefreshLoopID = null;
+        refreshIPAsync();
+        return GLib.SOURCE_REMOVE;
+      }
+    );
+  } catch (e) {
+    warn("_onNetworkStatusChanged threw: " + e);
   }
+}
+
+// New async refresh that never blocks the shell
+async function refreshIPAsync() {
+  if (isDisabled()) {
+    lg("refreshIPAsync(): disabled");
+    return true;
+  }
+
+  const now = Date.now();
+  if (now - lastCheck <= minTimeBetweenChecks * 1000) {
+    lg("refreshIPAsync(): throttled");
+    return true;
+  }
+  if (refreshInFlight) {
+    lg("refreshIPAsync(): another refresh in flight");
+    return true;
+  }
+  refreshInFlight = true;
+  lastCheck = now;
+  const myGen = ++refreshGen;
+
+  try {
+    const payload = await ipLookup.getAllAsync({ timeoutSec: 6 });
+    if (isDisabled() || myGen !== refreshGen) return true;
+
+    const { ip, geo, asn } = payload || {};
+    if (!ip || !geo) {
+      lg("refreshIPAsync(): empty result");
+      return true;
+    }
+
+    locationIP = {
+      ipAddress: ip,
+      countryCode: geo.countryCode,
+      countryName: geo.countryName,
+      cityName: geo.cityName,
+      latitude: geo.latitude,
+      longitude: geo.longitude,
+      isp: geo.isp,
+    };
+    lastLookup = { ip, geo, asn };
+
+    if (currentIP && currentIP !== ip) {
+      const now = Date.now();
+      if (now >= netEventSuppressNotifyUntil) {
+        try {
+          notify("External IP Address", `Has been changed to ${ip}`);
+        } catch (e) {
+          warn("notify failed: " + e);
+        }
+      } else {
+        lg(
+          `IP changed (${currentIP} -> ${ip}) but notifications suppressed for ${
+            netEventSuppressNotifyUntil - now
+          }ms`
+        );
+      }
+    }
+
+    currentIP = ip;
+
+    if (panelButton) {
+      try {
+        panelButton.update(
+          currentIP,
+          locationIP.countryCode,
+          locationIP.isp || null
+        );
+      } catch (e) {
+        warn("panelButton.update failed: " + e);
+      }
+    }
+  } catch (e) {
+    warn("refreshIPAsync(): " + e);
+  } finally {
+    refreshInFlight = false;
+  }
+  return true;
 }
 
 function lg(s) {
@@ -327,11 +433,17 @@ function warn(s) {
   } catch (_) {}
 }
 
-function isDisabled() { return disabled === true; }
+function isDisabled() {
+  return disabled === true;
+}
 
 function safeActorDesc(a) {
-  if (!a) return '<null>';
-  try { return a.toString(); } catch (_) { return '<actor?>'; }
+  if (!a) return "<null>";
+  try {
+    return a.toString();
+  } catch (_) {
+    return "<actor?>";
+  }
 }
 
 // returns raw HTTP response
@@ -364,17 +476,17 @@ function notify(title, msg) {
     lg("notify() skipped; extension disabled");
     return;
   }
+
   let source;
   try {
-    source = new MessageTray.Source(title, "img/ip.svg");
+    // DO NOT pass a filesystem path as the icon-name argument
+    source = new MessageTray.Source(title);
   } catch (e) {
     warn("Failed to create MessageTray.Source: " + e);
     return;
   }
 
   notification_msg_sources.add(source);
-  lg("notify(): created source " + safeActorDesc(source));
-
   try {
     Main.messageTray.add(source);
   } catch (e) {
@@ -386,21 +498,19 @@ function notify(title, msg) {
   try {
     notification = new MessageTray.Notification(source, title, msg, {
       bannerMarkup: true,
-      gicon: popup_icon,
+      gicon: popup_icon, // set by getIcon("ip.svg")
     });
   } catch (e) {
-    warn("Failed to build notification object: " + e);
+    warn("Failed to build notification: " + e);
     return;
   }
 
-  notification.connect("destroy", (destroyed_source) => {
-    lg("notification destroy signal for " + safeActorDesc(destroyed_source.source));
-    notification_msg_sources.delete(destroyed_source.source);
+  notification.connect("destroy", (n) => {
+    notification_msg_sources.delete(n.source);
   });
 
   try {
     source.showNotification(notification);
-    lg("notify(): displayed notification");
   } catch (e) {
     warn("Failed to show notification: " + e);
   }
@@ -418,73 +528,6 @@ function getFlagUrl(countryCode) {
 // if changed, show GNOME notification
 let lastCheck = 0;
 let locationIP = null;
-
-function refreshIP() {
-  if (isDisabled()) {
-    lg("refreshIP(): skipped; extension disabled");
-    return true;
-  }
-  const now = Date.now();
-  if (now - lastCheck <= minTimeBetweenChecks * 1000) {
-    lg("refreshIP(): throttled");
-    return true;
-  }
-  lastCheck = now;
-
-  let payload;
-  try {
-    payload = ipLookup.getAll();
-  } catch (e) {
-    warn("refreshIP(): ipLookup.getAll failed: " + e);
-    return true; // don't explode timer loops
-  }
-  const { ip, geo, asn } = payload;
-  if (!ip || !geo) {
-    lg("refreshIP(): IP/Geo lookup failed or empty; skipping update");
-    return true;
-  }
-
-  locationIP = {
-    ipAddress: ip,
-    countryCode: geo.countryCode,
-    countryName: geo.countryName,
-    cityName: geo.cityName,
-    latitude: geo.latitude,
-    longitude: geo.longitude,
-    isp: geo.isp,
-  };
-  lastLookup = { ip, geo, asn };
-
-  if (currentIP && currentIP !== ip) {
-    lg(`refreshIP(): IP changed ${currentIP} -> ${ip}`);
-    try {
-      notify("External IP Address", `Has been changed to ${ip}`);
-    } catch (e) {
-      warn("refreshIP(): notify failed: " + e);
-    }
-  }
-  currentIP = ip;
-
-  if (locationIP.countryCode) {
-    const url = getFlagUrl(locationIP.countryCode);
-    if (url) lg("refreshIP(): flag URL " + url);
-  }
-
-  if (panelButton) {
-    try {
-      panelButton.update(
-        currentIP,
-        locationIP.countryCode,
-        locationIP.isp || null
-      );
-    } catch (e) {
-      warn("refreshIP(): panelButton.update failed (possibly destroyed actor): " + e);
-    }
-  } else {
-    lg("refreshIP(): panelButton null (likely disabled)");
-  }
-  return true;
-}
 
 // wait until time elapsed, to be friendly to external ip url
 function timer() {
@@ -507,12 +550,13 @@ function timer() {
 
 // Run polling procedure completely async
 function ipPromise() {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve) => {
     try {
-      if (refreshIP()) resolve("success"); else reject("error");
+      await refreshIPAsync(); // <-- await the async refresh
+      resolve("success");
     } catch (e) {
-      warn("ipPromise(): refreshIP threw: " + e);
-      resolve("handled-exception");
+      warn("ipPromise(): refreshIPAsync threw: " + e);
+      resolve("handled-exception"); // don't break the timer loop
     }
   });
 }
@@ -582,51 +626,51 @@ function getCachedMap(lat, lon) {
 
 // Download application specific flags and cache locally
 function getCachedFlag(country) {
-  if (!country || typeof country !== "string") {
-    // Neutral icon if we don't know the country
+  if (!country || typeof country !== "string")
     return thisExtensionDir + "/img/ip.svg";
-  }
   country = country.toLowerCase();
 
-  let iconFileDestination = thisExtensionDir + "/flags/" + country + ".svg";
+  const iconFileDestination = thisExtensionDir + "/flags/" + country + ".svg";
+  const file = Gio.File.new_for_path(iconFileDestination);
+  if (file.query_exists(null)) return iconFileDestination;
 
-  const cwd = Gio.File.new_for_path(thisExtensionDir + "/flags/");
-  const newFile = cwd.get_child(country + ".svg");
-
-  // detects if icon is cached (exists)
-  const fileExists = newFile.query_exists(null);
-
-  if (!fileExists) {
-    // download and save in cache folder
-    // do this synchronously to ensure notifications always get a logo
-    let _httpSession = new Soup.SessionSync();
-
-    let url = getFlagUrl(country);
-    let message = Soup.Message.new("GET", url);
-    let responseCode = _httpSession.send_message(message);
-    let out = null;
-    let resp = null;
-    if (responseCode == 200) {
-      try {
-        let bytes = message["response-body"].flatten().get_data();
-        const file = Gio.File.new_for_path(iconFileDestination);
-        const [, etag] = file.replace_contents(
-          bytes,
-          null,
-          false,
-          Gio.FileCreateFlags.REPLACE_DESTINATION,
-          null
-        );
-      } catch (e) {
-        lg("Error in cached flag");
-        lg(e);
-      }
-    }
-  } else {
-    // icon is readily cached, return from icons folder locally
+  // Return fallback immediately; fetch in background and update later
+  const url = getFlagUrl(country);
+  if (url) {
+    try {
+      const session = new Soup.Session();
+      const msg = Soup.Message.new("GET", url);
+      session.queue_message(msg, (_s, m) => {
+        if (isDisabled()) return;
+        if (m && m.status_code === 200) {
+          try {
+            const bytes = m.response_body.flatten().get_data();
+            file.replace_contents(
+              bytes,
+              null,
+              false,
+              Gio.FileCreateFlags.REPLACE_DESTINATION,
+              null
+            );
+            // Update icon after download
+            if (panelButton && currentIP && locationIP) {
+              GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                try {
+                  panelButton.update(
+                    currentIP,
+                    country,
+                    locationIP.isp || null
+                  );
+                } catch (_) {}
+                return GLib.SOURCE_REMOVE;
+              });
+            }
+          } catch (_) {}
+        }
+      });
+    } catch (_) {}
   }
-
-  return iconFileDestination;
+  return thisExtensionDir + "/img/ip.svg"; // fallback immediately
 }
 
 // Returns SVG as gicon
@@ -676,17 +720,17 @@ function enable() {
 
   networkMonitorEnable();
 
-  refreshIP();
+  refreshIPAsync(); // <--
   timer();
 }
 
 function networkMonitorEnable() {
-  if (network_monitor) return; // already
+  if (network_monitor) return;
   network_monitor = Gio.network_monitor_get_default();
   try {
     network_monitor_connection = network_monitor.connect(
       "network-changed",
-      _onNetworkStatusChanged
+      _onNetworkStatusChanged   // the new 2-arg handler
     );
     lg("networkMonitorEnable(): connected id=" + network_monitor_connection);
   } catch (e) {
@@ -694,9 +738,14 @@ function networkMonitorEnable() {
   }
 }
 
+
 function networkMonitorDisable() {
   if (network_monitor && network_monitor_connection) {
-    try { network_monitor.disconnect(network_monitor_connection); } catch (e) { warn("networkMonitorDisable(): disconnect failed: " + e); }
+    try {
+      network_monitor.disconnect(network_monitor_connection);
+    } catch (e) {
+      warn("networkMonitorDisable(): disconnect failed: " + e);
+    }
   }
   network_monitor = null;
   network_monitor_connection = null;
@@ -712,7 +761,9 @@ function disable() {
   disabled = true;
 
   for (let source of notification_msg_sources) {
-    try { source.destroy(); } catch (_) {}
+    try {
+      source.destroy();
+    } catch (_) {}
   }
   notification_msg_sources.clear();
 
@@ -733,7 +784,11 @@ function disable() {
   locationIP = null;
 
   if (presence && presence_connection) {
-    try { presence.disconnectSignal(presence_connection); } catch (e) { warn("disable(): presence disconnect failed: " + e); }
+    try {
+      presence.disconnectSignal(presence_connection);
+    } catch (e) {
+      warn("disable(): presence disconnect failed: " + e);
+    }
   }
   presence = null;
   presence_connection = null;
@@ -756,7 +811,8 @@ function httpRequestAsync(url, cb) {
       return;
     }
     try {
-      if (m.status_code === 200) cb(null, m.response_body.data); else cb(new Error(`HTTP ${m.status_code}`));
+      if (m.status_code === 200) cb(null, m.response_body.data);
+      else cb(new Error(`HTTP ${m.status_code}`));
     } catch (e) {
       warn("httpRequestAsync(): user callback threw: " + e);
     }
